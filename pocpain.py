@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import requests
 from datetime import datetime, timedelta
 import sys
 import locale
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     locale.setlocale(locale.LC_TIME, 'fr_FR.UTF-8')
@@ -10,57 +13,83 @@ except:
     pass
 
 def get_options_data(asset):
-    url = f"https://www.deribit.com/api/v2/public/get_instruments?currency={asset}&kind=option&expired=false"
+    url = f"https://www.deribit.com/api/v2/public/get_instruments?currency={asset}&kind=option"
     response = requests.get(url)
-    return response.json()['result']
+    data = response.json()
+    return data['result']
 
-def get_open_interest(asset, strike, expiry):
-    url = f"https://www.deribit.com/api/v2/public/get_order_book?instrument_name={asset}-{strike}-{expiry}"
-    response = requests.get(url)
+def get_spot_price(asset):
+    url = f"https://www.deribit.com/api/v2/public/ticker?instrument_name={asset}-PERPETUAL"
     try:
-        return response.json()['result']['underlying_value']
+        response = requests.get(url, timeout=5).json()
+        return response['result']['last_price']
     except:
-        return 0
+        return None
 
-print("==== Calcul du Max Pain pondéré basé sur les OI et strikes ====")
+def get_open_interest(instrument_name):
+    url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_instrument?instrument_name={instrument_name}"
+    try:
+        response = requests.get(url, timeout=5).json()
+        result = response.get('result', [])
+        if not result:
+            return instrument_name, 0
+        return instrument_name, result[0].get('open_interest', 0)
+    except:
+        return instrument_name, 0
 
-# HARDCODE BTC pour GitHub Actions
-asset = "BTC"
-
-print(f"Asset analysé : {asset}")
-
-options = get_options_data(asset)
-expiries = sorted(set(opt['expiration_timestamp'] for opt in options))
-
-for exp_timestamp in expiries[:3]:  # 3 premières expirations
-    exp_date = datetime.fromtimestamp(exp_timestamp / 1000)
-    print(f"\n[{exp_date.strftime('%A %d %B %Y - %H:%M')} ({exp_date.strftime('%Z')})]")
-    
-    calls = []
-    puts = []
-    
+def filter_expirations(options, start_date, end_date):
+    expirations = []
     for opt in options:
-        if opt['expiration_timestamp'] == exp_timestamp:
-            oi = get_open_interest(asset, opt['strike'], opt['instrument_name'].split('-')[2])
-            if 'C' in opt['instrument_name']:
-                calls.append({'strike': opt['strike'], 'oi': oi})
-            else:
-                puts.append({'strike': opt['strike'], 'oi': oi})
+        exp_dt = datetime.fromtimestamp(opt['expiration_timestamp'] / 1000)
+        if start_date <= exp_dt <= end_date:
+            expirations.append(opt)
+    return expirations
+
+def calculate_max_pain(options_for_date):
+    total_opts = len(options_for_date)
     
-    if calls and puts:
-        max_call = max(calls, key=lambda x: x['oi'])
-        max_put = max(puts, key=lambda x: x['oi'])
+    print(f"Récupération de {total_opts} OI en parallèle...")
+    
+    oi_dict = {}
+    completed = 0
+    
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {
+            executor.submit(get_open_interest, opt['instrument_name']): opt
+            for opt in options_for_date
+        }
         
-        total_call_oi = sum(c['oi'] for c in calls)
-        total_put_oi = sum(p['oi'] for p in puts)
-        
-        call_pct = (max_call['oi'] / total_call_oi * 100) if total_call_oi > 0 else 0
-        put_pct = (max_put['oi'] / total_put_oi * 100) if total_put_oi > 0 else 0
-        
-        max_pain = (max_call['strike'] * max_call['oi'] + max_put['strike'] * max_put['oi']) / (max_call['oi'] + max_put['oi'])
-        precision = min(call_pct, put_pct)
-        
-        print(f"Max Call : {max_call['strike']} ({call_pct:.1f}% du total Calls)")
-        print(f"Max Put  : {max_put['strike']} ({put_pct:.1f}% du total Puts)")
-        print(f"Zone Max Pain approx : {min(max_call['strike'], max_put['strike'])} – {max(max_call['strike'], max_put['strike'])}")
-        print(f"Max Pain pondéré : {round(max_pain, 2)} (degré de précision : {precision:.1f}% )")
+        for future in as_completed(futures):
+            instrument_name, oi = future.result()
+            oi_dict[instrument_name] = oi
+            completed += 1
+            done = int(30 * completed / total_opts)
+            sys.stdout.write(
+                '\rRécupération OI : |' +
+                '█' * done +
+                ' ' * (30 - done) +
+                f'| {completed}/{total_opts}'
+            )
+            sys.stdout.flush()
+    
+    print()
+    
+    for opt in options_for_date:
+        opt['open_interest'] = oi_dict.get(opt['instrument_name'], 0)
+
+    calls = [opt for opt in options_for_date if opt['option_type'] == 'call' and opt['open_interest'] > 0]
+    puts  = [opt for opt in options_for_date if opt['option_type'] == 'put'  and opt['open_interest'] > 0]
+
+    if not calls or not puts:
+        return None, None, None, None, None, None
+
+    max_call_oi = max(calls, key=lambda x: x['open_interest'])
+    max_put_oi  = max(puts,  key=lambda x: x['open_interest'])
+
+    max_pain = (
+        max_call_oi['strike'] * max_call_oi['open_interest'] +
+        max_put_oi['strike']  * max_put_oi['open_interest']
+    ) / (max_call_oi['open_interest'] + max_put_oi['open_interest'])
+
+    total_oi = sum(opt['open_interest'] for opt in options_for_date)
+    if total_oi
